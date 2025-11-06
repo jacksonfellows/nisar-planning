@@ -14,7 +14,9 @@ To see the available options for `main.py`:
 uv run python main.py --help
 ```
 
-To find tracks that intersect the test study area in a 12 hour period:
+To find tracks that intersect the test study area in a 48 hour period (run `mkdir test_intersections` first if that directory doesn't exist):
 ```shell
-uv run python main.py test_boundary/boundary.shp '2025-11-05T20:00:00.000Z' test_intersections/intersections.shp --n-hours 12
+uv run python main.py test_boundary/boundary.shp '2025-11-05T20:00:00.000Z' test_intersections/intersections.shp --n-hours 48
 ```
+which will produce the following plot and also save polygons of the intersected areas to `test_intersections/intersections.shp`
+![Example output plot showing intersected areas](example_output.png)
