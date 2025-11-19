@@ -198,6 +198,11 @@ def main(
 ):
     # Load study area
     study_area_gdf = gpd.read_file(study_area_shp)
+    if study_area_gdf.crs is None:
+        raise ValueError("Study area CRS is undefined.")
+    if study_area_gdf.crs.to_epsg() != 3031:
+        click.echo("Converting study area CRS to EPSG:3031")
+        study_area_gdf = study_area_gdf.to_crs("EPSG:3031")
     study_area_poly = study_area_gdf.geometry.iloc[0]
 
     # Load satellite
