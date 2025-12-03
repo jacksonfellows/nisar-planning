@@ -11,12 +11,13 @@ from skyfield.positionlib import Geocentric, ICRF
 from skyfield.timelib import Time
 from skyfield.units import Distance, Velocity
 
-TLE_RELOAD = True
+# TLE_RELOAD = True
+TLE_RELOAD = False
 
 ts = load.timescale()
 
-# WGS84 (lat/lon) -> Antarctic polar stereographic
-transformer = pyproj.Transformer.from_crs("EPSG:4326", "EPSG:3031", always_xy=True)
+lonlat_to_south_polar = pyproj.Transformer.from_crs("EPSG:4326", "EPSG:3031", always_xy=True)
+itrf_to_south_polar = pyproj.Transformer.from_crs("EPSG:7789", "EPSG:3031", always_xy=True)
 
 def latlon_to_xy(coords_ll):
     """
@@ -25,7 +26,7 @@ def latlon_to_xy(coords_ll):
     """
     lon = coords_ll[:, 1]
     lat = coords_ll[:, 0]
-    x, y = transformer.transform(lon, lat)
+    x, y = lonlat_to_south_polar.transform(lon, lat)
     return np.column_stack([x, y])
 
 def xy_to_latlon(coords_xy):
@@ -35,7 +36,7 @@ def xy_to_latlon(coords_xy):
     """
     x = coords_xy[:, 0]
     y = coords_xy[:, 1]
-    lon, lat = transformer.transform(x, y, direction='INVERSE')
+    lon, lat = lonlat_to_south_polar.transform(x, y, direction='INVERSE')
     return np.column_stack([lat, lon])
 
 def calc_local_to_itrf_transform(g: Geocentric):
@@ -81,11 +82,21 @@ def find_swatch_line(
     P = lambda theta: np.array([0, l(theta)*np.sin(theta), r_sat - l(theta)*np.cos(theta)])
     line = []
     for theta_deg in [min_incidence_angle_deg, max_incidence_angle_deg]:
-        p = ICRF.from_time_and_frame_vectors(t, itrs, Distance(km=RT@P(np.deg2rad(theta_deg))), Velocity(km_per_s=np.zeros(3)))
+        p_itrf = RT@P(np.deg2rad(theta_deg))
+        p = ICRF.from_time_and_frame_vectors(t, itrs, Distance(km=p_itrf), Velocity(km_per_s=np.zeros(3)))
         p.center = 399 # geocentric
         # look at WGS84 elevation to see the error from my spherical assumptions?
         lat,lon = wgs84.latlon_of(p)
-        line.append((lat.degrees, lon.degrees))
+        # calc los and azimuth normals -- TODO plot these with tracks and check that they are correct in south polar projection
+        p_itrf_m = p_itrf*1e3
+        los = np.array(itrf_to_south_polar.transform(*p_itrf_m)) - np.array(itrf_to_south_polar.transform(*g.itrf_xyz().m))
+        los /= np.linalg.norm(los)
+        azimuth = np.array(itrf_to_south_polar.transform(*(p_itrf_m + RT@np.array([1,0,0])))) - np.array(itrf_to_south_polar.transform(*p_itrf_m))
+        azimuth /= np.linalg.norm(azimuth)
+        # With this method I'm getting azimuth z values from around 5e-3 to 1e-4.
+        # Not sure if this will be a problem, but I think that they should be strictly 0.
+        # This is probably a result of computing R^T (and its along-track vector) in the ITRF frame and then transforming to south polar.
+        line.append(dict(latlon=(lat.degrees, lon.degrees), normals=dict(los=los, azimuth=azimuth)))
     return line
 
 def load_satellite():
@@ -119,6 +130,14 @@ def compute_intersections(
     min_incidence_angle_deg: float,
     max_incidence_angle_deg: float
 ):
+    """
+    Find the tracks intersecting the study area for n_hours after t0.
+
+    Returns a list [{"los": ..., "azimuth": ..., "time": ..., "coords": ..., "poly": ...}, ...],
+    where "los" and "azimuth" are the respective normals at the corners of the track rectangle defined by "coords",
+    "time" is the time the satellite passes the corners defined by "coords",
+    and "poly" is a shapely polygon of the intersection with the study area.
+    """
     t0 = ts.from_datetime(t0_dt)
     t1 = t0 + datetime.timedelta(hours=n_hours)
     dt = datetime.timedelta(seconds=dt_s)
@@ -132,17 +151,30 @@ def compute_intersections(
         t += dt
         line = find_swatch_line(sat, t, min_incidence_angle_deg, max_incidence_angle_deg)
         poly = shapely.geometry.Polygon(
-            latlon_to_xy(np.array([prev_line[0], prev_line[1], line[1], line[0], prev_line[0]]))
+            latlon_to_xy(np.array([prev_line[0]["latlon"], prev_line[1]["latlon"], line[1]["latlon"], line[0]["latlon"], prev_line[0]["latlon"]]))
         )
         if shapely.intersects(poly, study_area_poly):
-            intersections.append(shapely.intersection(poly, study_area_poly))
+            los = np.array([x["normals"]["los"] for x in [*prev_line, *line]])
+            azimuth = np.array([x["normals"]["azimuth"] for x in [*prev_line, *line]])
+            t_prev = np.datetime64((t - dt).utc_datetime().replace(tzinfo=None))
+            t_now = np.datetime64(t.utc_datetime().replace(tzinfo=None))
+            time = np.array((t_prev, t_prev, t_now, t_now), dtype=np.datetime64)
+            coords = latlon_to_xy(np.array([x["latlon"] for x in [*prev_line, *line]]))
+            intersections.append(dict(
+                los=los,
+                azimuth=azimuth,
+                time=time,
+                coords=coords,
+                poly=shapely.intersection(poly, study_area_poly)),
+            )
+            
         prev_line = line
 
     click.echo(f"Found {len(intersections)} flight lines that intersect the study area")
     return intersections
 
 def save_intersections(intersections, crs, output_shp: str):
-    intersections_gdf = gpd.GeoDataFrame(geometry=intersections, crs=crs)
+    intersections_gdf = gpd.GeoDataFrame(geometry=[i["poly"] for i in intersections], crs=crs)
     intersections_gdf.to_file(output_shp)
     click.echo(f"Exported {len(intersections_gdf)} intersection polygons to {output_shp}")
 
@@ -161,7 +193,8 @@ def plot_intersections(intersections, study_area_poly):
         shorelines="0.5p,black"
     )
 
-    for poly in intersections:
+    for i in intersections:
+        poly = i["poly"]
         if poly.geom_type == 'Polygon':
             geoms = [poly]
         elif poly.geom_type == 'MultiPolygon':
